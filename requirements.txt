@@ -1,0 +1,15 @@
+boto3
+Flask
+Flask-Cors
+joblib
+lightgbm
+matplotlib
+mlflow
+dvc
+dvc[s3]
+nltk
+numpy
+pandas
+wordcloud
+seaborn
+-e .

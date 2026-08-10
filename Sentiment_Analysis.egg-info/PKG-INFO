@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: Sentiment-Analysis
+Version: 0.0.0
+Author: Ahmad Suleman
+Author-email: ahmadsulemanwahlajutt2003@gmail.com
+License-File: LICENSE
+Dynamic: author
+Dynamic: author-email
+Dynamic: license-file
