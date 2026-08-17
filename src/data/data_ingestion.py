@@ -90,20 +90,26 @@ def save_data(train_data: pd.DataFrame, test_data: pd.DataFrame, data_path: str)
 
 def main():
     try:
-        # Load parameters from the params.yaml in the root directory
         params = load_params(params_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../params.yaml'))
         test_size = params['data_ingestion']['test_size']
         
-        # Load data from the specified URL
         df = load_data(data_url='https://raw.githubusercontent.com/Himanshu-1703/reddit-sentiment-analysis/refs/heads/main/data/reddit.csv')
-        
-        # Preprocess the data
         final_df = preprocess_data(df)
         
-        # Split the data into training and testing sets
-        train_data, test_data = train_test_split(final_df, test_size=test_size, random_state=42)
+        # 🚨 FIX 1: Map labels to 0, 1, 2 for LightGBM compatibility
+        if -1 in final_df['category'].values:
+            final_df['category'] = final_df['category'].map({-1: 2, 0: 0, 1: 1})
+            # Drop any potential NaNs created by mapping unexpected values
+            final_df.dropna(subset=['category'], inplace=True)
         
-        # Save the split datasets and create the raw folder if it doesn't exist
+        # 🚨 FIX 2: Add stratify to ensure balanced representation in train/test
+        train_data, test_data = train_test_split(
+            final_df, 
+            test_size=test_size, 
+            random_state=42, 
+            stratify=final_df['category']
+        )
+        
         save_data(train_data, test_data, data_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../data'))
         
     except Exception as e:

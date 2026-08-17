@@ -13,3 +13,5 @@ pandas
 wordcloud
 seaborn
 -e .
+optuna
+imbalanced-learn

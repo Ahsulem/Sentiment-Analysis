@@ -3,7 +3,10 @@ data_ingestion:
 
 model_building:
   ngram_range: [1, 3]
-  max_features: 1000
+  max_features: 25000       # Bumped from 1,000 to give LightGBM full vocabulary visibility
+  sublinear_tf: true        # Apply logarithmic term frequency scaling
+  min_df: 3                 # Filter out rare typos and noisy single-instance words
+  max_df: 0.90              # Exclude ultra-common words appearing in >90% of comments
   learning_rate: 0.09
   max_depth: 20
   n_estimators: 367

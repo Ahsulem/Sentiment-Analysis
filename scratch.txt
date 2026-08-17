@@ -1,0 +1,1 @@
+519025700334.dkr.ecr.ap-south-1.amazonaws.com/youtube-sentiment

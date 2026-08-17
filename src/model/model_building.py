@@ -6,8 +6,19 @@ import yaml
 import logging
 import lightgbm as lgb
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
+from sklearn.metrics import accuracy_score, f1_score
+from imblearn.over_sampling import SMOTE
 
-# logging configuration
+# Optional dependency: Optuna. If not available, fall back to sklearn's RandomizedSearchCV
+try:
+    import optuna
+    HAS_OPTUNA = True
+except Exception:
+    optuna = None
+    HAS_OPTUNA = False
+
+# Logging configuration
 logger = logging.getLogger('model_building')
 logger.setLevel('DEBUG')
 
@@ -58,10 +69,23 @@ def load_data(file_path: str) -> pd.DataFrame:
         raise
 
 
-def apply_tfidf(train_data: pd.DataFrame, max_features: int, ngram_range: tuple) -> tuple:
-    """Apply TF-IDF with ngrams to the data."""
+def apply_tfidf(
+    train_data: pd.DataFrame, 
+    max_features: int, 
+    ngram_range: tuple,
+    sublinear_tf: bool = True,
+    min_df: int = 3,
+    max_df: float = 0.90
+) -> tuple:
+    """Apply TF-IDF with ngrams and SMOTE oversampling to the data."""
     try:
-        vectorizer = TfidfVectorizer(max_features=max_features, ngram_range=ngram_range)
+        vectorizer = TfidfVectorizer(
+            max_features=max_features, 
+            ngram_range=ngram_range,
+            sublinear_tf=sublinear_tf,
+            min_df=min_df,
+            max_df=max_df
+        )
 
         X_train = train_data['clean_comment'].values
         y_train = train_data['category'].values
@@ -69,36 +93,128 @@ def apply_tfidf(train_data: pd.DataFrame, max_features: int, ngram_range: tuple)
         # Perform TF-IDF transformation
         X_train_tfidf = vectorizer.fit_transform(X_train)
 
-        logger.debug(f"TF-IDF transformation complete. Train shape: {X_train_tfidf.shape}")
+        # Apply SMOTE to handle class imbalance across high-dimensional features
+        smote = SMOTE(random_state=42)
+        X_train_tfidf, y_train = smote.fit_resample(X_train_tfidf, y_train)
+
+        logger.debug(f"TF-IDF & SMOTE complete. Train shape: {X_train_tfidf.shape}")
 
         # Save the vectorizer in the root directory
         with open(os.path.join(get_root_directory(), 'tfidf_vectorizer.pkl'), 'wb') as f:
             pickle.dump(vectorizer, f)
 
-        logger.debug('TF-IDF applied with trigrams and data transformed')
+        logger.debug('TF-IDF applied with trigrams and vectorizer saved successfully.')
         return X_train_tfidf, y_train
     except Exception as e:
         logger.error('Error during TF-IDF transformation: %s', e)
         raise
 
 
-def train_lgbm(X_train: np.ndarray, y_train: np.ndarray, learning_rate: float, max_depth: int, n_estimators: int) -> lgb.LGBMClassifier:
-    """Train a LightGBM model."""
-    try:
-        best_model = lgb.LGBMClassifier(
-            objective='multiclass',
+def optimize_lgbm(X_train: np.ndarray, y_train: np.ndarray, n_trials: int = 20) -> dict:
+    """Run Optuna to find the best LightGBM hyperparameters optimizing for Macro F1.
+
+    If Optuna is not installed, fall back to RandomizedSearchCV from scikit-learn.
+    """
+    logger.debug(f'Starting hyperparameter optimization (Optuna installed={HAS_OPTUNA}) with {n_trials} trials...')
+
+    if HAS_OPTUNA:
+        def objective(trial):
+            params = {
+                'objective': 'multiclass',
+                'num_class': 3,
+                'metric': "multi_logloss",
+                'class_weight': "balanced",
+                'n_jobs': -1,
+                'random_state': 42,
+                'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+                'max_depth': trial.suggest_int('max_depth', 10, 50),
+                'num_leaves': trial.suggest_int('num_leaves', 31, 150),
+                'min_child_samples': trial.suggest_int('min_child_samples', 10, 100),
+                'reg_alpha': trial.suggest_float('reg_alpha', 1e-4, 10.0, log=True),
+                'reg_lambda': trial.suggest_float('reg_lambda', 1e-4, 10.0, log=True)
+            }
+
+            cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+            cv_scores = []
+
+            for train_idx, val_idx in cv.split(X_train, y_train):
+                X_fold_train, X_fold_val = X_train[train_idx], X_train[val_idx]
+                y_fold_train, y_fold_val = y_train[train_idx], y_train[val_idx]
+
+                model = lgb.LGBMClassifier(**params)
+                model.fit(X_fold_train, y_fold_train)
+
+                preds = model.predict(X_fold_val)
+                # Optimize for Macro F1 to balance evaluation across minority classes
+                score = f1_score(y_fold_val, preds, average='macro')
+                cv_scores.append(score)
+
+            return np.mean(cv_scores)
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=n_trials)
+
+        logger.debug(f'Optuna optimization finished. Best CV Macro F1: {study.best_value:.4f}')
+        return study.best_params
+    else:
+        logger.warning('Optuna is not installed — falling back to RandomizedSearchCV.')
+
+        param_dist = {
+            'n_estimators': [100, 150, 200, 300, 400, 500],
+            'learning_rate': [0.001, 0.01, 0.02, 0.05, 0.1],
+            'max_depth': [10, 15, 20, 30, 40, 50],
+            'num_leaves': [31, 50, 80, 120, 150],
+            'min_child_samples': [10, 20, 30, 50, 80, 100],
+            'reg_alpha': [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0],
+            'reg_lambda': [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0]
+        }
+
+        base_estimator = lgb.LGBMClassifier(
+            objective='multiclass', 
             num_class=3,
-            metric="multi_logloss",
-            is_unbalance=True,
-            class_weight="balanced",
-            reg_alpha=0.1,  # L1 regularization
-            reg_lambda=0.1,  # L2 regularization
-            learning_rate=learning_rate,
-            max_depth=max_depth,
-            n_estimators=n_estimators
+            metric='multi_logloss', 
+            class_weight='balanced',
+            n_jobs=-1, 
+            random_state=42
         )
+
+        rnd_search = RandomizedSearchCV(
+            estimator=base_estimator,
+            param_distributions=param_dist,
+            n_iter=n_trials,
+            scoring='f1_macro',
+            cv=3,
+            random_state=42,
+            n_jobs=-1,
+            verbose=0
+        )
+
+        rnd_search.fit(X_train, y_train)
+        logger.debug(f'RandomizedSearchCV finished. Best CV Macro F1: {rnd_search.best_score_:.4f}')
+
+        return rnd_search.best_params_
+
+
+def train_lgbm(X_train: np.ndarray, y_train: np.ndarray, best_params: dict) -> lgb.LGBMClassifier:
+    """Train the final LightGBM model using Optuna's best parameters."""
+    try:
+        final_params = {
+            'objective': 'multiclass',
+            'num_class': 3,
+            'metric': "multi_logloss",
+            'class_weight': "balanced",
+            'n_jobs': -1,
+            'random_state': 42,
+            **best_params
+        }
+        
+        best_model = lgb.LGBMClassifier(**final_params)
         best_model.fit(X_train, y_train)
-        logger.debug('LightGBM model training completed')
+        
+        logger.debug('Final LightGBM model training completed with optimized parameters.')
         return best_model
     except Exception as e:
         logger.error('Error during LightGBM model training: %s', e)
@@ -124,29 +240,36 @@ def get_root_directory() -> str:
 
 def main():
     try:
-        # Get root directory and resolve the path for params.yaml
         root_dir = get_root_directory()
-
-        # Load parameters from the root directory
         params = load_params(os.path.join(root_dir, 'params.yaml'))
-        max_features = params['model_building']['max_features']
-        ngram_range = tuple(params['model_building']['ngram_range'])
+        
+        mb_params = params['model_building']
+        max_features = mb_params['max_features']
+        ngram_range = tuple(mb_params['ngram_range'])
+        sublinear_tf = mb_params.get('sublinear_tf', True)
+        min_df = mb_params.get('min_df', 3)
+        max_df = mb_params.get('max_df', 0.90)
 
-        learning_rate = params['model_building']['learning_rate']
-        max_depth = params['model_building']['max_depth']
-        n_estimators = params['model_building']['n_estimators']
-
-        # Load the preprocessed training data from the interim directory
         train_data = load_data(os.path.join(root_dir, 'data/interim/train_processed.csv'))
 
-        # Apply TF-IDF feature engineering on training data
-        X_train_tfidf, y_train = apply_tfidf(train_data, max_features, ngram_range)
+        # Step 1: Apply TF-IDF feature engineering & SMOTE oversampling
+        X_train_tfidf, y_train = apply_tfidf(
+            train_data, 
+            max_features, 
+            ngram_range,
+            sublinear_tf=sublinear_tf,
+            min_df=min_df,
+            max_df=max_df
+        )
 
-        # Train the LightGBM model using hyperparameters from params.yaml
-        best_model = train_lgbm(X_train_tfidf, y_train, learning_rate, max_depth, n_estimators)
+        # Step 2: Run hyperparameter search optimizing for Macro F1
+        best_params = optimize_lgbm(X_train_tfidf, y_train, n_trials=20)
 
-        # Save the trained model in the root directory
-        save_model(best_model, os.path.join(root_dir, 'lgbm_model.pkl'))
+        # Step 3: Train final model
+        final_model = train_lgbm(X_train_tfidf, y_train, best_params)
+
+        # Step 4: Save artifact
+        save_model(final_model, os.path.join(root_dir, 'lgbm_model.pkl'))
 
     except Exception as e:
         logger.error('Failed to complete the feature engineering and model building process: %s', e)
